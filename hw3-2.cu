@@ -77,10 +77,10 @@ int main(int argc, char **argv) {
     /* input */
     TIMING_START(input);
     input_file = fopen(input_filename, "rb");
-    fread(&V, 1, sizeof(int), input_file);
-    fread(&E, 1, sizeof(int), input_file);
+    fread(&V, sizeof(int), 1, input_file);
+    fread(&E, sizeof(int), 1, input_file);
     edge = (edge_t *)malloc(sizeof(edge_t) * E);
-    fread(edge, E, sizeof(edge_t), input_file);
+    fread(edge, sizeof(edge_t), E, input_file);
     dist = (int *)malloc(sizeof(int) * V * V);
     fclose(input_file);
     DEBUG_PRINT("vertices: %d\nedges: %d\n", V, E);
@@ -135,7 +135,7 @@ int main(int argc, char **argv) {
     /* output */
     TIMING_START(output);
     output_file = fopen(output_filename, "wb+");
-    fwrite(dist, V * V, sizeof(int), output_file);
+    fwrite(dist, sizeof(int), V * V, output_file);
     fclose(output_file);
     TIMING_END(output);
     TIMING_END(hw3_1);
