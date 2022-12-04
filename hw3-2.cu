@@ -44,7 +44,7 @@
 #define TIMING_END(arg)
 #endif  // TIMING
 
-#define block_size 40
+#define block_size 32
 const int INF = ((1 << 30) - 1);
 
 struct edge_t {
@@ -56,6 +56,10 @@ struct edge_t {
 int blk_idx(int r, int c, int nblocks);
 
 void proc(int *blk_dist, int s_i, int e_i, int s_j, int e_j, int k, int nblocks, int ncpus);
+
+__global__ void proc_1_glob(int *blk_dist, int k, int nblocks);
+__global__ void proc_2_glob(int *blk_dist, int s, int k, int nblocks);
+__global__ void proc_3_glob(int *blk_dist, int s_i, int s_j, int k, int nblocks);
 
 int main(int argc, char **argv) {
     assert(argc == 3);
@@ -71,12 +75,14 @@ int main(int argc, char **argv) {
     int VP;
     int nblocks;
     int *blk_dist;
+    int *blk_dist_dev;
 
     TIMING_START(hw3_1);
 
     /* input */
     TIMING_START(input);
     input_file = fopen(input_filename, "rb");
+    assert(input_file);
     fread(&V, sizeof(int), 1, input_file);
     fread(&E, sizeof(int), 1, input_file);
     edge = (edge_t *)malloc(sizeof(edge_t) * E);
@@ -92,41 +98,49 @@ int main(int argc, char **argv) {
     VP = nblocks * block_size;
     blk_dist = (int *)malloc(sizeof(int) * VP * VP);
 
-#pragma omp parallel for num_threads(ncpus) schedule(static) default(shared) collapse(2)
     for (int i = 0; i < VP; i++) {
         for (int j = 0; j < VP; j++) {
-            if(i == j)
+            if (i == j)
                 blk_dist[blk_idx(i, j, nblocks)] = 0;
             else
                 blk_dist[blk_idx(i, j, nblocks)] = INF;
         }
     }
 
-#pragma omp parallel for num_threads(ncpus) schedule(static) default(shared)
     for (int i = 0; i < E; i++) {
         blk_dist[blk_idx(edge[i].src, edge[i].dst, nblocks)] = edge[i].w;
     }
 
-    for (int k = 0; k < nblocks; k++) {
+    cudaHostRegister(blk_dist, sizeof(int) * VP * VP, cudaHostRegisterDefault);
+    cudaMalloc(&blk_dist_dev, sizeof(int) * VP * VP);
+    cudaMemcpy(blk_dist_dev, blk_dist, sizeof(int) * VP * VP, cudaMemcpyHostToDevice);
+
+    dim3 blk(block_size, block_size);
+    for (int k = 0, nk = nblocks - 1; k < nblocks; k++, nk--) {
         /* Phase 1 */
-        proc(blk_dist, k, k + 1, k, k + 1, k, nblocks, ncpus);
+        proc_1_glob<<<1, blk>>>(blk_dist_dev, k, nblocks);
         /* Phase 2 */
-        proc(blk_dist, k, k + 1, 0, k, k, nblocks, ncpus);
-        proc(blk_dist, k, k + 1, k + 1, nblocks, k, nblocks, ncpus);
-        proc(blk_dist, 0, k, k, k + 1, k, nblocks, ncpus);
-        proc(blk_dist, k + 1, nblocks, k, k + 1, k, nblocks, ncpus);
+        if (k)
+            proc_2_glob<<<k, blk>>>(blk_dist_dev, 0, k, nblocks);
+        if (nk)
+            proc_2_glob<<<nk, blk>>>(blk_dist_dev, k + 1, k, nblocks);
         /* Phase 3 */
-        proc(blk_dist, 0, k, 0, k, k, nblocks, ncpus);
-        proc(blk_dist, 0, k, k + 1, nblocks, k, nblocks, ncpus);
-        proc(blk_dist, k + 1, nblocks, 0, k, k, nblocks, ncpus);
-        proc(blk_dist, k + 1, nblocks, k + 1, nblocks, k, nblocks, ncpus);
+        if (k)
+            proc_3_glob<<<dim3(k, k), blk>>>(blk_dist_dev, 0, 0, k, nblocks);
+        if (k && nk)
+            proc_3_glob<<<dim3(nk, k), blk>>>(blk_dist_dev, 0, k + 1, k, nblocks);
+        if (k && nk)
+            proc_3_glob<<<dim3(k, nk), blk>>>(blk_dist_dev, k + 1, 0, k, nblocks);
+        if (nk)
+            proc_3_glob<<<dim3(nk, nk), blk>>>(blk_dist_dev, k + 1, k + 1, k, nblocks);
     }
 
+    cudaMemcpy(blk_dist, blk_dist_dev, sizeof(int) * VP * VP, cudaMemcpyDeviceToHost);
+
     /* Copy result to dist */
-#pragma omp parallel for num_threads(ncpus) schedule(static) default(shared) collapse(2)
     for (int i = 0; i < V; i++) {
         for (int j = 0; j < V; j++) {
-            dist[i * V + j] = blk_dist[blk_idx(i, j, nblocks)] > INF ? INF : blk_dist[blk_idx(i, j, nblocks)];
+            dist[i * V + j] = min(blk_dist[blk_idx(i, j, nblocks)], INF);
         }
     }
 
@@ -134,7 +148,8 @@ int main(int argc, char **argv) {
 
     /* output */
     TIMING_START(output);
-    output_file = fopen(output_filename, "wb+");
+    output_file = fopen(output_filename, "w");
+    assert(output_file);
     fwrite(dist, sizeof(int), V * V, output_file);
     fclose(output_file);
     TIMING_END(output);
@@ -144,6 +159,7 @@ int main(int argc, char **argv) {
     free(edge);
     free(dist);
     free(blk_dist);
+    cudaFree(blk_dist_dev);
     return 0;
 }
 
@@ -168,4 +184,79 @@ void proc(int *blk_dist, int s_i, int e_i, int s_j, int e_j, int k, int nblocks,
             }
         }
     }
+}
+
+__global__ void proc_1_glob(int *blk_dist, int k, int nblocks) {
+    __shared__ int k_k_sm[block_size][block_size];
+
+    int r = threadIdx.y;
+    int c = threadIdx.x;
+    int *k_k_ptr = blk_dist + (k * nblocks + k) * (block_size * block_size);
+    int tmp;
+
+    k_k_sm[r][c] = k_k_ptr[r * block_size + c];
+    __syncthreads();
+
+#pragma unroll 32
+    for (int b = 0; b < block_size; b++) {
+        tmp = k_k_sm[r][b] + k_k_sm[b][c];
+        if (tmp < k_k_sm[r][c])
+            k_k_sm[r][c] = tmp;
+        __syncthreads();
+    }
+    k_k_ptr[r * block_size + c] = k_k_sm[r][c];
+}
+__global__ void proc_2_glob(int *blk_dist, int s, int k, int nblocks) {
+    __shared__ int i_k_sm[block_size][block_size];
+    __shared__ int k_j_sm[block_size][block_size];
+    __shared__ int k_k_sm[block_size][block_size];
+
+    int i = s + blockIdx.x;
+    int j = s + blockIdx.x;
+    int r = threadIdx.y;
+    int c = threadIdx.x;
+    int *i_k_ptr = blk_dist + (i * nblocks + k) * (block_size * block_size);
+    int *k_j_ptr = blk_dist + (k * nblocks + j) * (block_size * block_size);
+    int *k_k_ptr = blk_dist + (k * nblocks + k) * (block_size * block_size);
+    int tmp;
+
+    i_k_sm[r][c] = i_k_ptr[r * block_size + c];
+    k_j_sm[r][c] = k_j_ptr[r * block_size + c];
+    k_k_sm[r][c] = k_k_ptr[r * block_size + c];
+    __syncthreads();
+
+#pragma unroll 32
+    for (int b = 0; b < block_size; b++) {
+        i_k_sm[r][c] = min(i_k_sm[r][c], i_k_sm[r][b] + k_k_sm[b][c]);
+        k_j_sm[r][c] = min(k_j_sm[r][c], k_k_sm[r][b] + k_j_sm[b][c]);
+        __syncthreads();
+    }
+    i_k_ptr[r * block_size + c] = i_k_sm[r][c];
+    k_j_ptr[r * block_size + c] = k_j_sm[r][c];
+}
+__global__ void proc_3_glob(int *blk_dist, int s_i, int s_j, int k, int nblocks) {
+    __shared__ int i_k_sm[block_size][block_size];
+    __shared__ int k_j_sm[block_size][block_size];
+
+    int i = s_i + blockIdx.y;
+    int j = s_j + blockIdx.x;
+    int r = threadIdx.y;
+    int c = threadIdx.x;
+    int *i_k_ptr = blk_dist + (i * nblocks + k) * (block_size * block_size);
+    int *i_j_ptr = blk_dist + (i * nblocks + j) * (block_size * block_size);
+    int *k_j_ptr = blk_dist + (k * nblocks + j) * (block_size * block_size);
+    int loc, tmp;
+
+    i_k_sm[r][c] = i_k_ptr[r * block_size + c];
+    k_j_sm[r][c] = k_j_ptr[r * block_size + c];
+    __syncthreads();
+    loc = i_j_ptr[r * block_size + c];
+
+#pragma unroll 32
+    for (int b = 0; b < block_size; b++) {
+        tmp = i_k_sm[r][b] + k_j_sm[b][c];
+        if (tmp < loc)
+            loc = tmp;
+    }
+    i_j_ptr[r * block_size + c] = loc;
 }
