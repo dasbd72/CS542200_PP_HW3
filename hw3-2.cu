@@ -44,7 +44,8 @@
 #define TIMING_END(arg)
 #endif  // TIMING
 
-#define block_size 32
+#define block_size 64
+#define div_block 2
 const int INF = ((1 << 30) - 1);
 
 struct edge_t {
@@ -115,7 +116,7 @@ int main(int argc, char **argv) {
     cudaMalloc(&blk_dist_dev, sizeof(int) * VP * VP);
     cudaMemcpy(blk_dist_dev, blk_dist, sizeof(int) * VP * VP, cudaMemcpyHostToDevice);
 
-    dim3 blk(block_size, block_size);
+    dim3 blk(block_size / div_block, block_size / div_block);
     for (int k = 0, nk = nblocks - 1; k < nblocks; k++, nk--) {
         /* Phase 1 */
         proc_1_glob<<<1, blk>>>(blk_dist_dev, k, nblocks);
@@ -189,22 +190,40 @@ void proc(int *blk_dist, int s_i, int e_i, int s_j, int e_j, int k, int nblocks,
 __global__ void proc_1_glob(int *blk_dist, int k, int nblocks) {
     __shared__ int k_k_sm[block_size][block_size];
 
-    int r = threadIdx.y;
-    int c = threadIdx.x;
+    int r = threadIdx.y * div_block;
+    int c = threadIdx.x * div_block;
     int *k_k_ptr = blk_dist + (k * nblocks + k) * (block_size * block_size);
     int tmp;
 
-    k_k_sm[r][c] = k_k_ptr[r * block_size + c];
+#pragma unroll
+    for (int rr = 0; rr < div_block; rr++) {
+#pragma unroll
+        for (int cc = 0; cc < div_block; cc++) {
+            k_k_sm[r + rr][c + cc] = k_k_ptr[(r + rr) * block_size + c + cc];
+        }
+    }
     __syncthreads();
 
-#pragma unroll 32
+#pragma unroll
     for (int b = 0; b < block_size; b++) {
-        tmp = k_k_sm[r][b] + k_k_sm[b][c];
-        if (tmp < k_k_sm[r][c])
-            k_k_sm[r][c] = tmp;
+#pragma unroll
+        for (int rr = 0; rr < div_block; rr++) {
+#pragma unroll
+            for (int cc = 0; cc < div_block; cc++) {
+                tmp = k_k_sm[r + rr][b] + k_k_sm[b][c + cc];
+                if (tmp < k_k_sm[r + rr][c + cc])
+                    k_k_sm[r + rr][c + cc] = tmp;
+            }
+        }
         __syncthreads();
     }
-    k_k_ptr[r * block_size + c] = k_k_sm[r][c];
+#pragma unroll
+    for (int rr = 0; rr < div_block; rr++) {
+#pragma unroll
+        for (int cc = 0; cc < div_block; cc++) {
+            k_k_ptr[(r + rr) * block_size + c + cc] = k_k_sm[r + rr][c + cc];
+        }
+    }
 }
 __global__ void proc_2_glob(int *blk_dist, int s, int k, int nblocks) {
     __shared__ int i_k_sm[block_size][block_size];
@@ -213,26 +232,48 @@ __global__ void proc_2_glob(int *blk_dist, int s, int k, int nblocks) {
 
     int i = s + blockIdx.x;
     int j = s + blockIdx.x;
-    int r = threadIdx.y;
-    int c = threadIdx.x;
+    int r = threadIdx.y * div_block;
+    int c = threadIdx.x * div_block;
     int *i_k_ptr = blk_dist + (i * nblocks + k) * (block_size * block_size);
     int *k_j_ptr = blk_dist + (k * nblocks + j) * (block_size * block_size);
     int *k_k_ptr = blk_dist + (k * nblocks + k) * (block_size * block_size);
-    int tmp;
+    int tmp_i_k, tmp_k_j;
 
-    i_k_sm[r][c] = i_k_ptr[r * block_size + c];
-    k_j_sm[r][c] = k_j_ptr[r * block_size + c];
-    k_k_sm[r][c] = k_k_ptr[r * block_size + c];
+#pragma unroll
+    for (int rr = 0; rr < div_block; rr++) {
+#pragma unroll
+        for (int cc = 0; cc < div_block; cc++) {
+            i_k_sm[r + rr][c + cc] = i_k_ptr[(r + rr) * block_size + c + cc];
+            k_j_sm[r + rr][c + cc] = k_j_ptr[(r + rr) * block_size + c + cc];
+            k_k_sm[r + rr][c + cc] = k_k_ptr[(r + rr) * block_size + c + cc];
+        }
+    }
     __syncthreads();
 
-#pragma unroll 32
+#pragma unroll
     for (int b = 0; b < block_size; b++) {
-        i_k_sm[r][c] = min(i_k_sm[r][c], i_k_sm[r][b] + k_k_sm[b][c]);
-        k_j_sm[r][c] = min(k_j_sm[r][c], k_k_sm[r][b] + k_j_sm[b][c]);
+#pragma unroll
+        for (int rr = 0; rr < div_block; rr++) {
+#pragma unroll
+            for (int cc = 0; cc < div_block; cc++) {
+                tmp_i_k = i_k_sm[r + rr][b] + k_k_sm[b][c + cc];
+                if (tmp_i_k < i_k_sm[r + rr][c + cc])
+                    i_k_sm[r + rr][c + cc] = tmp_i_k;
+                tmp_k_j = k_k_sm[r + rr][b] + k_j_sm[b][c + cc];
+                if (tmp_k_j < k_j_sm[r + rr][c + cc])
+                    k_j_sm[r + rr][c + cc] = tmp_k_j;
+            }
+        }
         __syncthreads();
     }
-    i_k_ptr[r * block_size + c] = i_k_sm[r][c];
-    k_j_ptr[r * block_size + c] = k_j_sm[r][c];
+#pragma unroll
+    for (int rr = 0; rr < div_block; rr++) {
+#pragma unroll
+        for (int cc = 0; cc < div_block; cc++) {
+            i_k_ptr[(r + rr) * block_size + c + cc] = i_k_sm[r + rr][c + cc];
+            k_j_ptr[(r + rr) * block_size + c + cc] = k_j_sm[r + rr][c + cc];
+        }
+    }
 }
 __global__ void proc_3_glob(int *blk_dist, int s_i, int s_j, int k, int nblocks) {
     __shared__ int i_k_sm[block_size][block_size];
@@ -240,23 +281,47 @@ __global__ void proc_3_glob(int *blk_dist, int s_i, int s_j, int k, int nblocks)
 
     int i = s_i + blockIdx.y;
     int j = s_j + blockIdx.x;
-    int r = threadIdx.y;
-    int c = threadIdx.x;
+    int r = threadIdx.y * div_block;
+    int c = threadIdx.x * div_block;
     int *i_k_ptr = blk_dist + (i * nblocks + k) * (block_size * block_size);
     int *i_j_ptr = blk_dist + (i * nblocks + j) * (block_size * block_size);
     int *k_j_ptr = blk_dist + (k * nblocks + j) * (block_size * block_size);
-    int loc, tmp;
+    int loc[div_block][div_block], tmp;
 
-    i_k_sm[r][c] = i_k_ptr[r * block_size + c];
-    k_j_sm[r][c] = k_j_ptr[r * block_size + c];
-    __syncthreads();
-    loc = i_j_ptr[r * block_size + c];
-
-#pragma unroll 32
-    for (int b = 0; b < block_size; b++) {
-        tmp = i_k_sm[r][b] + k_j_sm[b][c];
-        if (tmp < loc)
-            loc = tmp;
+#pragma unroll
+    for (int rr = 0; rr < div_block; rr++) {
+#pragma unroll
+        for (int cc = 0; cc < div_block; cc++) {
+            i_k_sm[r + rr][c + cc] = i_k_ptr[(r + rr) * block_size + c + cc];
+            k_j_sm[r + rr][c + cc] = k_j_ptr[(r + rr) * block_size + c + cc];
+        }
     }
-    i_j_ptr[r * block_size + c] = loc;
+    __syncthreads();
+#pragma unroll
+    for (int rr = 0; rr < div_block; rr++) {
+#pragma unroll
+        for (int cc = 0; cc < div_block; cc++) {
+            loc[rr][cc] = i_j_ptr[(r + rr) * block_size + c + cc];
+        }
+    }
+
+#pragma unroll
+    for (int b = 0; b < block_size; b++) {
+#pragma unroll
+        for (int rr = 0; rr < div_block; rr++) {
+#pragma unroll
+            for (int cc = 0; cc < div_block; cc++) {
+                tmp = i_k_sm[r + rr][b] + k_j_sm[b][c + cc];
+                if (tmp < loc[rr][cc])
+                    loc[rr][cc] = tmp;
+            }
+        }
+    }
+#pragma unroll
+    for (int rr = 0; rr < div_block; rr++) {
+#pragma unroll
+        for (int cc = 0; cc < div_block; cc++) {
+            i_j_ptr[(r + rr) * block_size + c + cc] = loc[rr][cc];
+        }
+    }
 }
