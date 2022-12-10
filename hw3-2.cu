@@ -14,9 +14,28 @@
 #ifdef DEBUG
 #define DEBUG_PRINT(fmt, args...) fprintf(stderr, fmt, ##args);
 #define DEBUG_MSG(str) std::cout << str << "\n";
+#define CUDA_EXE(F)                                                \
+    {                                                              \
+        cudaError_t err = F;                                       \
+        if ((err != cudaSuccess)) {                                \
+            printf("Error %s at %s:%d\n", cudaGetErrorString(err), \
+                   __FILE__, __LINE__);                            \
+            exit(-1);                                              \
+        }                                                          \
+    }
+#define CUDA_CHECK()                                                                    \
+    {                                                                                   \
+        cudaError_t err = cudaGetLastError();                                           \
+        if ((err != cudaSuccess)) {                                                     \
+            printf("Error %s at %s:%d\n", cudaGetErrorString(err), __FILE__, __LINE__); \
+            exit(-1);                                                                   \
+        }                                                                               \
+    }
 #else
 #define DEBUG_PRINT(fmt, args...)
 #define DEBUG_MSG(str)
+#define CUDA_EXE(F) F;
+#define CUDA_CHECK()
 #endif  // DEBUG
 
 #ifdef TIMING
@@ -44,23 +63,20 @@
 #define TIMING_END(arg)
 #endif  // TIMING
 
+#define TILE 32
 #define block_size 64
 #define div_block 2
 const int INF = ((1 << 30) - 1);
 
-struct edge_t {
-    int src;
-    int dst;
-    int w;
-};
+__device__ int blk_idx(int r, int c, int blk_pitch, int nblocks);
 
-int blk_idx(int r, int c, int nblocks);
+__global__ void proc_1_glob(int *blk_dist, int k, int blk_pitch, int nblocks);
+__global__ void proc_2_glob(int *blk_dist, int s, int k, int blk_pitch, int nblocks);
+__global__ void proc_3_glob(int *blk_dist, int s_i, int s_j, int k, int blk_pitch, int nblocks);
 
-void proc(int *blk_dist, int s_i, int e_i, int s_j, int e_j, int k, int nblocks, int ncpus);
-
-__global__ void proc_1_glob(int *blk_dist, int k, int nblocks);
-__global__ void proc_2_glob(int *blk_dist, int s, int k, int nblocks);
-__global__ void proc_3_glob(int *blk_dist, int s_i, int s_j, int k, int nblocks);
+__global__ void init_dist(int *blk_dist, int blk_pitch, int nblocks);
+__global__ void build_dist(int *edge, int E, int *blk_dist, int blk_pitch, int nblocks);
+__global__ void copy_dist(int *blk_dist, int blk_pitch, int *dist, int pitch, int V, int nblocks);
 
 int main(int argc, char **argv) {
     assert(argc == 3);
@@ -70,13 +86,20 @@ int main(int argc, char **argv) {
     FILE *input_file;
     FILE *output_file;
     int ncpus = omp_get_max_threads();
+    int device_cnt;
     int V, E;
-    edge_t *edge;
+    int *edge;
+    int *edge_dev;
     int *dist;
+    int *dist_dev;
     int VP;
     int nblocks;
-    int *blk_dist;
     int *blk_dist_dev;
+    size_t pitch, int_pitch;
+    size_t blk_pitch, blk_int_pitch;
+
+    cudaGetDeviceCount(&device_cnt);
+    cudaSetDevice(0);
 
     TIMING_START(hw3_1);
 
@@ -86,8 +109,8 @@ int main(int argc, char **argv) {
     assert(input_file);
     fread(&V, sizeof(int), 1, input_file);
     fread(&E, sizeof(int), 1, input_file);
-    edge = (edge_t *)malloc(sizeof(edge_t) * E);
-    fread(edge, sizeof(edge_t), E, input_file);
+    edge = (int *)malloc(sizeof(int) * 3 * E);
+    fread(edge, sizeof(int), 3 * E, input_file);
     dist = (int *)malloc(sizeof(int) * V * V);
     fclose(input_file);
     DEBUG_PRINT("vertices: %d\nedges: %d\n", V, E);
@@ -97,61 +120,42 @@ int main(int argc, char **argv) {
     TIMING_START(calculate);
     nblocks = (int)ceilf(float(V) / block_size);
     VP = nblocks * block_size;
-    blk_dist = (int *)malloc(sizeof(int) * VP * VP);
 
-    for (int i = 0; i < VP; i++) {
-        for (int j = 0; j < VP; j++) {
-            if (i == j)
-                blk_dist[blk_idx(i, j, nblocks)] = 0;
-            else
-                blk_dist[blk_idx(i, j, nblocks)] = INF;
-        }
-    }
+    cudaHostRegister(edge, sizeof(int) * 3 * E, cudaHostRegisterReadOnly);
+    cudaMalloc(&edge_dev, sizeof(int) * 3 * E);
+    cudaHostRegister(dist, sizeof(int) * V * V, cudaHostRegisterDefault);
+    cudaMallocPitch(&dist_dev, &pitch, sizeof(int) * V, V);
+    cudaMallocPitch(&blk_dist_dev, &blk_pitch, sizeof(int) * block_size * block_size, nblocks * nblocks);
 
-    for (int i = 0; i < E; i++) {
-        blk_dist[blk_idx(edge[i].src, edge[i].dst, nblocks)] = edge[i].w;
-    }
+    cudaMemcpy(edge_dev, edge, sizeof(int) * 3 * E, cudaMemcpyDefault);
 
-    cudaHostRegister(blk_dist, sizeof(int) * VP * VP, cudaHostRegisterDefault);
-    cudaMalloc(&blk_dist_dev, sizeof(int) * VP * VP);
-    cudaMemcpy(blk_dist_dev, blk_dist, sizeof(int) * VP * VP, cudaMemcpyHostToDevice);
+    blk_int_pitch = blk_pitch >> 2;
+    int_pitch = pitch >> 2;
 
-    dim3 blk(block_size / div_block, block_size / div_block);
+    init_dist<<<dim3(VP / TILE, VP / TILE), dim3(TILE, TILE)>>>(blk_dist_dev, blk_int_pitch, nblocks);
+    build_dist<<<(int)ceilf((float)E / (TILE * TILE)), TILE * TILE>>>(edge_dev, E, blk_dist_dev, blk_int_pitch, nblocks);
+
+    dim3 blk(TILE, TILE);
     for (int k = 0, nk = nblocks - 1; k < nblocks; k++, nk--) {
         /* Phase 1 */
-        proc_1_glob<<<1, blk>>>(blk_dist_dev, k, nblocks);
+        proc_1_glob<<<1, blk>>>(blk_dist_dev, k, blk_int_pitch, nblocks);
         /* Phase 2 */
-        if (k)
-            proc_2_glob<<<k, blk>>>(blk_dist_dev, 0, k, nblocks);
-        if (nk)
-            proc_2_glob<<<nk, blk>>>(blk_dist_dev, k + 1, k, nblocks);
+        proc_2_glob<<<dim3(nblocks - 1, 2), blk>>>(blk_dist_dev, 0, k, blk_int_pitch, nblocks);
         /* Phase 3 */
-        if (k)
-            proc_3_glob<<<dim3(k, k), blk>>>(blk_dist_dev, 0, 0, k, nblocks);
-        if (k && nk)
-            proc_3_glob<<<dim3(nk, k), blk>>>(blk_dist_dev, 0, k + 1, k, nblocks);
-        if (k && nk)
-            proc_3_glob<<<dim3(k, nk), blk>>>(blk_dist_dev, k + 1, 0, k, nblocks);
-        if (nk)
-            proc_3_glob<<<dim3(nk, nk), blk>>>(blk_dist_dev, k + 1, k + 1, k, nblocks);
+        proc_3_glob<<<dim3(nblocks - 1, nblocks - 1), blk>>>(blk_dist_dev, 0, 0, k, blk_int_pitch, nblocks);
     }
 
-    cudaMemcpy(blk_dist, blk_dist_dev, sizeof(int) * VP * VP, cudaMemcpyDeviceToHost);
+    copy_dist<<<dim3(VP / TILE, VP / TILE), dim3(TILE, TILE)>>>(blk_dist_dev, blk_int_pitch, dist_dev, int_pitch, V, nblocks);
+    cudaMemcpy2D(dist, sizeof(int) * V, dist_dev, pitch, sizeof(int) * V, V, cudaMemcpyDefault);
 
-    /* Copy result to dist */
-    for (int i = 0; i < V; i++) {
-        for (int j = 0; j < V; j++) {
-            dist[i * V + j] = min(blk_dist[blk_idx(i, j, nblocks)], INF);
-        }
-    }
-
+    cudaDeviceSynchronize();
     TIMING_END(calculate);
 
     /* output */
     TIMING_START(output);
     output_file = fopen(output_filename, "w");
     assert(output_file);
-    fwrite(dist, sizeof(int), V * V, output_file);
+    fwrite(dist, 1, sizeof(int) * V * V, output_file);
     fclose(output_file);
     TIMING_END(output);
     TIMING_END(hw3_1);
@@ -159,47 +163,28 @@ int main(int argc, char **argv) {
     /* finalize */
     free(edge);
     free(dist);
-    free(blk_dist);
+    cudaFree(edge_dev);
+    cudaFree(dist_dev);
     cudaFree(blk_dist_dev);
     return 0;
 }
 
-int blk_idx(int r, int c, int nblocks) {
-    return ((r / block_size) * nblocks + (c / block_size)) * block_size * block_size + (r % block_size) * block_size + (c % block_size);
+__device__ int blk_idx(int r, int c, int blk_pitch, int nblocks) {
+    return ((r / block_size) * nblocks + (c / block_size)) * blk_pitch + (r % block_size) * block_size + (c % block_size);
 }
 
-void proc(int *blk_dist, int s_i, int e_i, int s_j, int e_j, int k, int nblocks, int ncpus) {
-#pragma omp parallel for num_threads(ncpus) schedule(static) default(shared) collapse(2)
-    for (int i = s_i; i < e_i; i++) {
-        for (int j = s_j; j < e_j; j++) {
-            int *ik_ptr = blk_dist + (i * nblocks + k) * block_size * block_size;
-            int *ij_ptr = blk_dist + (i * nblocks + j) * block_size * block_size;
-            int *kj_ptr = blk_dist + (k * nblocks + j) * block_size * block_size;
-            for (int b = 0; b < block_size; b++) {
-                for (int r = 0; r < block_size; r++) {
-#pragma omp simd
-                    for (int c = 0; c < block_size; c++) {
-                        ij_ptr[r * block_size + c] = std::min(ij_ptr[r * block_size + c], ik_ptr[r * block_size + b] + kj_ptr[b * block_size + c]);
-                    }
-                }
-            }
-        }
-    }
-}
-
-__global__ void proc_1_glob(int *blk_dist, int k, int nblocks) {
+#define _ref(i, j, r, c) blk_dist[(i * nblocks + j) * blk_pitch + (r)*block_size + c]
+__global__ void proc_1_glob(int *blk_dist, int k, int blk_pitch, int nblocks) {
     __shared__ int k_k_sm[block_size][block_size];
 
-    int r = threadIdx.y * div_block;
-    int c = threadIdx.x * div_block;
-    int *k_k_ptr = blk_dist + (k * nblocks + k) * (block_size * block_size);
-    int tmp;
+    int r = threadIdx.y;
+    int c = threadIdx.x;
 
 #pragma unroll
     for (int rr = 0; rr < div_block; rr++) {
 #pragma unroll
         for (int cc = 0; cc < div_block; cc++) {
-            k_k_sm[r + rr][c + cc] = k_k_ptr[(r + rr) * block_size + c + cc];
+            k_k_sm[r + rr * TILE][c + cc * TILE] = _ref(k, k, r + rr * TILE, c + cc * TILE);
         }
     }
     __syncthreads();
@@ -210,9 +195,7 @@ __global__ void proc_1_glob(int *blk_dist, int k, int nblocks) {
         for (int rr = 0; rr < div_block; rr++) {
 #pragma unroll
             for (int cc = 0; cc < div_block; cc++) {
-                tmp = k_k_sm[r + rr][b] + k_k_sm[b][c + cc];
-                if (tmp < k_k_sm[r + rr][c + cc])
-                    k_k_sm[r + rr][c + cc] = tmp;
+                k_k_sm[r + rr * TILE][c + cc * TILE] = min(k_k_sm[r + rr * TILE][c + cc * TILE], k_k_sm[r + rr * TILE][b] + k_k_sm[b][c + cc * TILE]);
             }
         }
         __syncthreads();
@@ -221,79 +204,115 @@ __global__ void proc_1_glob(int *blk_dist, int k, int nblocks) {
     for (int rr = 0; rr < div_block; rr++) {
 #pragma unroll
         for (int cc = 0; cc < div_block; cc++) {
-            k_k_ptr[(r + rr) * block_size + c + cc] = k_k_sm[r + rr][c + cc];
+            _ref(k, k, r + rr * TILE, c + cc * TILE) = k_k_sm[r + rr * TILE][c + cc * TILE];
         }
     }
 }
-__global__ void proc_2_glob(int *blk_dist, int s, int k, int nblocks) {
-    __shared__ int i_k_sm[block_size][block_size];
-    __shared__ int k_j_sm[block_size][block_size];
+__global__ void proc_2_glob(int *blk_dist, int s, int k, int blk_pitch, int nblocks) {
     __shared__ int k_k_sm[block_size][block_size];
+    __shared__ int sm[block_size][block_size];
 
     int i = s + blockIdx.x;
-    int j = s + blockIdx.x;
-    int r = threadIdx.y * div_block;
-    int c = threadIdx.x * div_block;
-    int *i_k_ptr = blk_dist + (i * nblocks + k) * (block_size * block_size);
-    int *k_j_ptr = blk_dist + (k * nblocks + j) * (block_size * block_size);
-    int *k_k_ptr = blk_dist + (k * nblocks + k) * (block_size * block_size);
-    int tmp_i_k, tmp_k_j;
+    int r = threadIdx.y;
+    int c = threadIdx.x;
+
+    if (i >= k)
+        i++;
 
 #pragma unroll
     for (int rr = 0; rr < div_block; rr++) {
 #pragma unroll
         for (int cc = 0; cc < div_block; cc++) {
-            i_k_sm[r + rr][c + cc] = i_k_ptr[(r + rr) * block_size + c + cc];
-            k_j_sm[r + rr][c + cc] = k_j_ptr[(r + rr) * block_size + c + cc];
-            k_k_sm[r + rr][c + cc] = k_k_ptr[(r + rr) * block_size + c + cc];
+            k_k_sm[r + rr * TILE][c + cc * TILE] = _ref(k, k, r + rr * TILE, c + cc * TILE);
         }
     }
-    __syncthreads();
-
-#pragma unroll
-    for (int b = 0; b < block_size; b++) {
+    if (blockIdx.y == 0) {
+        /* rows */
 #pragma unroll
         for (int rr = 0; rr < div_block; rr++) {
 #pragma unroll
             for (int cc = 0; cc < div_block; cc++) {
-                tmp_i_k = i_k_sm[r + rr][b] + k_k_sm[b][c + cc];
-                if (tmp_i_k < i_k_sm[r + rr][c + cc])
-                    i_k_sm[r + rr][c + cc] = tmp_i_k;
-                tmp_k_j = k_k_sm[r + rr][b] + k_j_sm[b][c + cc];
-                if (tmp_k_j < k_j_sm[r + rr][c + cc])
-                    k_j_sm[r + rr][c + cc] = tmp_k_j;
+                sm[r + rr * TILE][c + cc * TILE] = _ref(i, k, r + rr * TILE, c + cc * TILE);
             }
         }
         __syncthreads();
-    }
+
 #pragma unroll
-    for (int rr = 0; rr < div_block; rr++) {
+        for (int b = 0; b < block_size; b++) {
 #pragma unroll
-        for (int cc = 0; cc < div_block; cc++) {
-            i_k_ptr[(r + rr) * block_size + c + cc] = i_k_sm[r + rr][c + cc];
-            k_j_ptr[(r + rr) * block_size + c + cc] = k_j_sm[r + rr][c + cc];
+            for (int rr = 0; rr < div_block; rr++) {
+#pragma unroll
+                for (int cc = 0; cc < div_block; cc++) {
+                    sm[r + rr * TILE][c + cc * TILE] = min(sm[r + rr * TILE][c + cc * TILE], sm[r + rr * TILE][b] + k_k_sm[b][c + cc * TILE]);
+                }
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int rr = 0; rr < div_block; rr++) {
+#pragma unroll
+            for (int cc = 0; cc < div_block; cc++) {
+                _ref(i, k, r + rr * TILE, c + cc * TILE) = sm[r + rr * TILE][c + cc * TILE];
+            }
+        }
+    } else {
+        /* cols */
+#pragma unroll
+        for (int rr = 0; rr < div_block; rr++) {
+#pragma unroll
+            for (int cc = 0; cc < div_block; cc++) {
+                sm[r + rr * TILE][c + cc * TILE] = _ref(k, i, r + rr * TILE, c + cc * TILE);
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int b = 0; b < block_size; b++) {
+#pragma unroll
+            for (int rr = 0; rr < div_block; rr++) {
+#pragma unroll
+                for (int cc = 0; cc < div_block; cc++) {
+                    sm[r + rr * TILE][c + cc * TILE] = min(sm[r + rr * TILE][c + cc * TILE], k_k_sm[r + rr * TILE][b] + sm[b][c + cc * TILE]);
+                }
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int rr = 0; rr < div_block; rr++) {
+#pragma unroll
+            for (int cc = 0; cc < div_block; cc++) {
+                _ref(k, i, r + rr * TILE, c + cc * TILE) = sm[r + rr * TILE][c + cc * TILE];
+            }
         }
     }
 }
-__global__ void proc_3_glob(int *blk_dist, int s_i, int s_j, int k, int nblocks) {
+__global__ void proc_3_glob(int *blk_dist, int s_i, int s_j, int k, int blk_pitch, int nblocks) {
     __shared__ int i_k_sm[block_size][block_size];
     __shared__ int k_j_sm[block_size][block_size];
 
     int i = s_i + blockIdx.y;
     int j = s_j + blockIdx.x;
-    int r = threadIdx.y * div_block;
-    int c = threadIdx.x * div_block;
-    int *i_k_ptr = blk_dist + (i * nblocks + k) * (block_size * block_size);
-    int *i_j_ptr = blk_dist + (i * nblocks + j) * (block_size * block_size);
-    int *k_j_ptr = blk_dist + (k * nblocks + j) * (block_size * block_size);
-    int loc[div_block][div_block], tmp;
+    int r = threadIdx.y;
+    int c = threadIdx.x;
+    int loc[div_block][div_block];
+
+    if (i >= k)
+        i++;
+    if (j >= k)
+        j++;
 
 #pragma unroll
     for (int rr = 0; rr < div_block; rr++) {
 #pragma unroll
         for (int cc = 0; cc < div_block; cc++) {
-            i_k_sm[r + rr][c + cc] = i_k_ptr[(r + rr) * block_size + c + cc];
-            k_j_sm[r + rr][c + cc] = k_j_ptr[(r + rr) * block_size + c + cc];
+            i_k_sm[r + rr * TILE][c + cc * TILE] = _ref(i, k, r + rr * TILE, c + cc * TILE);
+        }
+    }
+#pragma unroll
+    for (int rr = 0; rr < div_block; rr++) {
+#pragma unroll
+        for (int cc = 0; cc < div_block; cc++) {
+            k_j_sm[r + rr * TILE][c + cc * TILE] = _ref(k, j, r + rr * TILE, c + cc * TILE);
         }
     }
     __syncthreads();
@@ -301,7 +320,7 @@ __global__ void proc_3_glob(int *blk_dist, int s_i, int s_j, int k, int nblocks)
     for (int rr = 0; rr < div_block; rr++) {
 #pragma unroll
         for (int cc = 0; cc < div_block; cc++) {
-            loc[rr][cc] = i_j_ptr[(r + rr) * block_size + c + cc];
+            loc[rr][cc] = _ref(i, j, r + rr * TILE, c + cc * TILE);
         }
     }
 
@@ -311,9 +330,7 @@ __global__ void proc_3_glob(int *blk_dist, int s_i, int s_j, int k, int nblocks)
         for (int rr = 0; rr < div_block; rr++) {
 #pragma unroll
             for (int cc = 0; cc < div_block; cc++) {
-                tmp = i_k_sm[r + rr][b] + k_j_sm[b][c + cc];
-                if (tmp < loc[rr][cc])
-                    loc[rr][cc] = tmp;
+                loc[rr][cc] = min(loc[rr][cc], i_k_sm[r + rr * TILE][b] + k_j_sm[b][c + cc * TILE]);
             }
         }
     }
@@ -321,7 +338,28 @@ __global__ void proc_3_glob(int *blk_dist, int s_i, int s_j, int k, int nblocks)
     for (int rr = 0; rr < div_block; rr++) {
 #pragma unroll
         for (int cc = 0; cc < div_block; cc++) {
-            i_j_ptr[(r + rr) * block_size + c + cc] = loc[rr][cc];
+            _ref(i, j, r + rr * TILE, c + cc * TILE) = loc[rr][cc];
         }
+    }
+}
+__global__ void init_dist(int *blk_dist, int blk_pitch, int nblocks) {
+    int r = blockIdx.y * blockDim.y + threadIdx.y;
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    blk_dist[blk_idx(r, c, blk_pitch, nblocks)] = (r != c) * INF;
+}
+__global__ void build_dist(int *edge, int E, int *blk_dist, int blk_pitch, int nblocks) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < E) {
+        int src = *(edge + idx * 3);
+        int dst = *(edge + idx * 3 + 1);
+        int w = *(edge + idx * 3 + 2);
+        blk_dist[blk_idx(src, dst, blk_pitch, nblocks)] = w;
+    }
+}
+__global__ void copy_dist(int *blk_dist, int blk_pitch, int *dist, int pitch, int V, int nblocks) {
+    int r = blockIdx.y * blockDim.y + threadIdx.y;
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r < V && c < V) {
+        dist[r * pitch + c] = blk_dist[blk_idx(r, c, blk_pitch, nblocks)];
     }
 }
