@@ -91,7 +91,6 @@ int main(int argc, char **argv) {
     int *dist_dev[2];
     int VP;
     int nblocks;
-    size_t pitch[2], int_pitch[2];
 
     cudaGetDeviceCount(&device_cnt);
 
@@ -131,8 +130,7 @@ int main(int argc, char **argv) {
         CUDA_CHECK();
         cudaMalloc(&edge_dev[tid], sizeof(int) * 3 * E);
         CUDA_CHECK();
-        CUDA_EXE(cudaMallocPitch(&dist_dev[tid], &pitch[tid], sizeof(int) * VP, VP));
-        int_pitch[tid] = pitch[tid] >> 2;
+        CUDA_EXE(cudaMalloc(&dist_dev[tid], sizeof(int) * VP * VP));
         CUDA_CHECK();
 
         cudaMemcpy(edge_dev[tid], edge, sizeof(int) * 3 * E, cudaMemcpyDefault);
@@ -140,9 +138,9 @@ int main(int argc, char **argv) {
 #pragma omp barrier
 
         CUDA_CHECK();
-        init_dist<<<dim3(VP / TILE, VP / TILE), dim3(TILE, TILE)>>>(dist_dev[tid], int_pitch[tid]);
+        init_dist<<<dim3(VP / TILE, VP / TILE), dim3(TILE, TILE)>>>(dist_dev[tid], VP);
         CUDA_CHECK();
-        build_dist<<<(int)ceilf((float)E / (TILE * TILE)), TILE * TILE>>>(edge_dev[tid], E, dist_dev[tid], int_pitch[tid]);
+        build_dist<<<(int)ceilf((float)E / (TILE * TILE)), TILE * TILE>>>(edge_dev[tid], E, dist_dev[tid], VP);
         CUDA_CHECK();
         cudaFree(edge_dev[tid]);
 
@@ -151,29 +149,29 @@ int main(int argc, char **argv) {
             /* Sync */
             if (range > 0 && k >= start && k < start + range)
                 CUDA_EXE(cudaMemcpy2D(
-                    dist_dev[peerid] + int_pitch[peerid] * block_size * k, pitch[peerid],
-                    dist_dev[tid] + int_pitch[tid] * block_size * k, pitch[tid],
+                    dist_dev[peerid] + VP * block_size * k, sizeof(int) * VP,
+                    dist_dev[tid] + VP * block_size * k, sizeof(int) * VP,
                     sizeof(int) * VP, block_size, cudaMemcpyDefault));
 #pragma omp barrier
             /* Phase 1 */
-            proc_1_glob<<<1, blk>>>(dist_dev[tid], k, int_pitch[tid]);
+            proc_1_glob<<<1, blk>>>(dist_dev[tid], k, VP);
             /* Phase 2 */
             if (nblocks - 1 > 0)
-                proc_2_glob<<<dim3(nblocks - 1, 2), blk>>>(dist_dev[tid], 0, k, int_pitch[tid]);
+                proc_2_glob<<<dim3(nblocks - 1, 2), blk>>>(dist_dev[tid], 0, k, VP);
             /* Phase 3 */
             if (nblocks - 1 > 0 && range > 0)
-                proc_3_glob<<<dim3(nblocks - 1, range), blk>>>(dist_dev[tid], start, 0, k, int_pitch[tid]);
+                proc_3_glob<<<dim3(nblocks - 1, range), blk>>>(dist_dev[tid], start, 0, k, VP);
         }
         if (tid == 0) {
             CUDA_EXE(cudaHostRegister(dist, sizeof(int) * V * V, cudaHostRegisterDefault));
 #pragma omp barrier
-            CUDA_EXE(cudaMemcpy2D(dist, sizeof(int) * V, dist_dev[tid], pitch[tid], sizeof(int) * V, V, cudaMemcpyDefault));
+            CUDA_EXE(cudaMemcpy2D(dist, sizeof(int) * V, dist_dev[tid], sizeof(int) * VP, sizeof(int) * V, V, cudaMemcpyDefault));
             CUDA_EXE(cudaHostUnregister(dist));
         } else {
             if (range > 0)
                 CUDA_EXE(cudaMemcpy2D(
-                    dist_dev[peerid] + int_pitch[peerid] * block_size * start, pitch[peerid],
-                    dist_dev[tid] + int_pitch[tid] * block_size * start, pitch[tid],
+                    dist_dev[peerid] + VP * block_size * start, sizeof(int) * VP,
+                    dist_dev[tid] + VP * block_size * start, sizeof(int) * VP,
                     sizeof(int) * VP, block_size * range, cudaMemcpyDefault));
 #pragma omp barrier
         }

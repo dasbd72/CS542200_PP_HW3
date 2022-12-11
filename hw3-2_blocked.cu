@@ -91,7 +91,6 @@ int main(int argc, char **argv) {
     int *dist_dev;
     int VP;
     int nblocks;
-    size_t pitch, int_pitch;
 
     cudaGetDeviceCount(&device_cnt);
     cudaSetDevice(0);
@@ -119,25 +118,24 @@ int main(int argc, char **argv) {
     cudaHostRegister(edge, sizeof(int) * 3 * E, cudaHostRegisterReadOnly);
     cudaMalloc(&edge_dev, sizeof(int) * 3 * E);
     cudaHostRegister(dist, sizeof(int) * V * V, cudaHostRegisterDefault);
-    cudaMallocPitch(&dist_dev, &pitch, sizeof(int) * VP, VP);
-    int_pitch = pitch >> 2;
+    cudaMalloc(&dist_dev, sizeof(int) * VP * VP);
 
     cudaMemcpy(edge_dev, edge, sizeof(int) * 3 * E, cudaMemcpyDefault);
 
-    init_dist<<<dim3(VP / TILE, VP / TILE), dim3(TILE, TILE)>>>(dist_dev, int_pitch);
-    build_dist<<<(int)ceilf((float)E / (TILE * TILE)), TILE * TILE>>>(edge_dev, E, dist_dev, int_pitch);
+    init_dist<<<dim3(VP / TILE, VP / TILE), dim3(TILE, TILE)>>>(dist_dev, VP);
+    build_dist<<<(int)ceilf((float)E / (TILE * TILE)), TILE * TILE>>>(edge_dev, E, dist_dev, VP);
 
     dim3 blk(TILE, TILE);
     for (int k = 0, nk = nblocks - 1; k < nblocks; k++, nk--) {
         /* Phase 1 */
-        proc_1_glob<<<1, blk>>>(dist_dev, k, int_pitch);
+        proc_1_glob<<<1, blk>>>(dist_dev, k, VP);
         /* Phase 2 */
-        proc_2_glob<<<dim3(nblocks - 1, 2), blk>>>(dist_dev, 0, k, int_pitch);
+        proc_2_glob<<<dim3(nblocks - 1, 2), blk>>>(dist_dev, 0, k, VP);
         /* Phase 3 */
-        proc_3_glob<<<dim3(nblocks - 1, nblocks - 1), blk>>>(dist_dev, 0, 0, k, int_pitch);
+        proc_3_glob<<<dim3(nblocks - 1, nblocks - 1), blk>>>(dist_dev, 0, 0, k, VP);
     }
 
-    cudaMemcpy2D(dist, sizeof(int) * V, dist_dev, pitch, sizeof(int) * V, V, cudaMemcpyDefault);
+    cudaMemcpy2D(dist, sizeof(int) * V, dist_dev, sizeof(int) * VP, sizeof(int) * V, V, cudaMemcpyDefault);
 
     cudaDeviceSynchronize();
     TIMING_END(calculate);
